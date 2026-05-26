@@ -1,44 +1,39 @@
 #!/usr/bin/env python3
 """
-Nmap Web Backend — FastAPI service that wraps nmap scans.
+Nmap Web Dashboard — FastAPI Backend
+Wraps the system nmap binary and exposes HTTP endpoints for scan management.
 
-Provides HTTP endpoints to:
-  - Start scans   POST /scans
-  - List scans    GET  /scans
-  - Get scan      GET  /scans/{id}
-  - Cancel scan   POST /scans/{id}/cancel
-  - Delete scan   DELETE /scans/{id}
-
-Run with:
+Usage:
     pip install fastapi uvicorn
-    sudo python nmap_backend.py
+    python nmap_backend.py
 
-Root (sudo) is required for SYN (-sS), UDP (-sU), and OS detection (-O) scans.
+    # With auth token
+    NMAP_AUTH_TOKEN=secret python nmap_backend.py
+
+    # Root/sudo required for: SYN (-sS), UDP (-sU), OS detection (-O)
+    sudo python nmap_backend.py
 """
 
 import asyncio
-import json
 import os
 import re
 import subprocess
 import uuid
-from datetime import datetime
-from typing import Any
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import xml.etree.ElementTree as ET
 
 # ─── Config ──────────────────────────────────────────────────────────────────
 
 AUTH_TOKEN = os.environ.get("NMAP_AUTH_TOKEN", "")
-PORT = int(os.environ.get("NMAP_BACKEND_PORT", "8765"))
+PORT       = int(os.environ.get("NMAP_BACKEND_PORT", "8765"))
 
-# In-memory store (replace with Redis/DB for multi-process)
 SCANS: dict[str, dict] = {}
 
-app = FastAPI(title="Nmap Web Backend", version="1.0.0")
+app = FastAPI(title="Nmap Web Dashboard API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -90,12 +85,16 @@ class ScanResponse(BaseModel):
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
-def _require_auth(x_auth_token: str | None) -> None:
+def utcnow() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def require_auth(x_auth_token: str | None) -> None:
     if AUTH_TOKEN and x_auth_token != AUTH_TOKEN:
-        raise HTTPException(status_code=401, detail="Invalid or missing auth token")
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Auth-Token header")
 
 
-def _parse_nmap_xml(xml_text: str) -> list[HostEntry]:
+def parse_nmap_xml(xml_text: str) -> list[HostEntry]:
     hosts: list[HostEntry] = []
     try:
         root = ET.fromstring(xml_text)
@@ -106,8 +105,8 @@ def _parse_nmap_xml(xml_text: str) -> list[HostEntry]:
         addr_elem = host_elem.find("address")
         address = addr_elem.get("addr", "") if addr_elem is not None else ""
 
-        hostnames_elem = host_elem.find("hostnames")
         hostname = None
+        hostnames_elem = host_elem.find("hostnames")
         if hostnames_elem is not None:
             hname = hostnames_elem.find("hostname")
             if hname is not None:
@@ -127,90 +126,74 @@ def _parse_nmap_xml(xml_text: str) -> list[HostEntry]:
         ports_elem = host_elem.find("ports")
         if ports_elem is not None:
             for port_elem in ports_elem.findall("port"):
-                port_id = int(port_elem.get("portid", "0"))
-                protocol = port_elem.get("protocol", "tcp")
+                port_id   = int(port_elem.get("portid", "0"))
+                protocol  = port_elem.get("protocol", "tcp")
                 state_elem = port_elem.find("state")
-                state = state_elem.get("state", "unknown") if state_elem is not None else "unknown"
+                state     = state_elem.get("state", "unknown") if state_elem is not None else "unknown"
 
                 service_elem = port_elem.find("service")
-                service = ""
-                product = version = extrainfo = cpe = None
+                service = product = version = extrainfo = cpe = None
                 if service_elem is not None:
-                    service = service_elem.get("name", "")
-                    product = service_elem.get("product") or None
-                    version = service_elem.get("version") or None
+                    service   = service_elem.get("name", "") or None
+                    product   = service_elem.get("product") or None
+                    version   = service_elem.get("version") or None
                     extrainfo = service_elem.get("extrainfo") or None
-                    cpe_elem = service_elem.find("cpe")
+                    cpe_elem  = service_elem.find("cpe")
                     if cpe_elem is not None and cpe_elem.text:
                         cpe = cpe_elem.text
 
                 ports.append(PortEntry(
-                    port=port_id,
-                    protocol=protocol,
-                    state=state,
-                    service=service,
-                    product=product,
-                    version=version,
-                    extrainfo=extrainfo,
-                    cpe=cpe,
+                    port=port_id, protocol=protocol, state=state,
+                    service=service or "", product=product, version=version,
+                    extrainfo=extrainfo, cpe=cpe,
                 ))
 
         hosts.append(HostEntry(
-            address=address,
-            hostname=hostname,
-            status=status,
-            os=os_name,
-            ports=ports,
+            address=address, hostname=hostname, status=status, os=os_name, ports=ports,
         ))
 
     return hosts
 
 
-async def _run_scan(scan_id: str, target: str, args: str) -> None:
+async def run_scan(scan_id: str, target: str, args: str) -> None:
     scan = SCANS[scan_id]
     scan["status"] = "running"
-    scan["started_at"] = datetime.utcnow().isoformat()
+    scan["started_at"] = utcnow()
 
-    # Build command
-    cmd_parts = ["nmap", "-oX", "-"]
+    cmd = ["nmap", "-oX", "-"]
     if args:
-        # Split args safely — basic shell-like split
-        cmd_parts.extend(re.split(r"\s+", args.strip()))
-    cmd_parts.append(target)
-    scan["command"] = " ".join(cmd_parts)
+        cmd.extend(re.split(r"\s+", args.strip()))
+    cmd.append(target)
+    scan["command"] = " ".join(cmd)
 
     try:
         proc = await asyncio.create_subprocess_exec(
-            *cmd_parts,
+            *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         scan["_proc"] = proc
         stdout, stderr = await proc.communicate()
 
-        raw_out = stdout.decode("utf-8", errors="replace")
-        err_out = stderr.decode("utf-8", errors="replace")
+        raw = stdout.decode("utf-8", errors="replace")
+        err = stderr.decode("utf-8", errors="replace")
+        scan["raw"] = raw + ("\n\n=== STDERR ===\n" + err if err else "")
 
-        scan["raw"] = raw_out
-        if err_out:
-            scan["raw"] += "\n\n=== STDERR ===\n" + err_out
-
-        if proc.returncode != 0 and not raw_out.strip():
+        if proc.returncode != 0 and not raw.strip():
             scan["status"] = "failed"
-            scan["error"] = err_out or f"nmap exited with code {proc.returncode}"
+            scan["error"]  = err or f"nmap exited with code {proc.returncode}"
         else:
-            hosts = _parse_nmap_xml(raw_out)
-            scan["hosts"] = [h.model_dump() for h in hosts]
+            scan["hosts"]  = [h.model_dump() for h in parse_nmap_xml(raw)]
             scan["status"] = "completed"
 
     except FileNotFoundError:
         scan["status"] = "failed"
-        scan["error"] = "nmap not found. Install nmap first."
+        scan["error"]  = "nmap not found — install nmap and ensure it is in $PATH"
     except Exception as exc:
         scan["status"] = "failed"
-        scan["error"] = str(exc)
+        scan["error"]  = str(exc)
     finally:
-        scan["finished_at"] = datetime.utcnow().isoformat()
+        scan["finished_at"] = utcnow()
         scan.pop("_proc", None)
 
 
@@ -221,21 +204,14 @@ async def start_scan(
     body: StartScanRequest,
     x_auth_token: str | None = Header(default=None, alias="X-Auth-Token"),
 ):
-    _require_auth(x_auth_token)
+    require_auth(x_auth_token)
     scan_id = str(uuid.uuid4())
     SCANS[scan_id] = {
-        "id": scan_id,
-        "target": body.target,
-        "args": body.args,
-        "status": "queued",
-        "started_at": datetime.utcnow().isoformat(),
-        "finished_at": None,
-        "command": None,
-        "error": None,
-        "hosts": [],
-        "raw": None,
+        "id": scan_id, "target": body.target, "args": body.args,
+        "status": "queued", "started_at": utcnow(), "finished_at": None,
+        "command": None, "error": None, "hosts": [], "raw": None,
     }
-    asyncio.create_task(_run_scan(scan_id, body.target, body.args))
+    asyncio.create_task(run_scan(scan_id, body.target, body.args))
     return ScanResponse(**SCANS[scan_id])
 
 
@@ -243,7 +219,7 @@ async def start_scan(
 async def list_scans(
     x_auth_token: str | None = Header(default=None, alias="X-Auth-Token"),
 ):
-    _require_auth(x_auth_token)
+    require_auth(x_auth_token)
     return [ScanResponse(**s) for s in sorted(SCANS.values(), key=lambda x: x["started_at"], reverse=True)]
 
 
@@ -252,7 +228,7 @@ async def get_scan(
     scan_id: str,
     x_auth_token: str | None = Header(default=None, alias="X-Auth-Token"),
 ):
-    _require_auth(x_auth_token)
+    require_auth(x_auth_token)
     if scan_id not in SCANS:
         raise HTTPException(status_code=404, detail="Scan not found")
     return ScanResponse(**SCANS[scan_id])
@@ -263,7 +239,7 @@ async def cancel_scan(
     scan_id: str,
     x_auth_token: str | None = Header(default=None, alias="X-Auth-Token"),
 ):
-    _require_auth(x_auth_token)
+    require_auth(x_auth_token)
     if scan_id not in SCANS:
         raise HTTPException(status_code=404, detail="Scan not found")
     scan = SCANS[scan_id]
@@ -272,8 +248,8 @@ async def cancel_scan(
         proc.kill()
         await proc.wait()
     scan["status"] = "failed"
-    scan["error"] = "Cancelled by user"
-    scan["finished_at"] = datetime.utcnow().isoformat()
+    scan["error"]  = "Cancelled by user"
+    scan["finished_at"] = utcnow()
     return {"detail": "Cancelled"}
 
 
@@ -282,7 +258,7 @@ async def delete_scan(
     scan_id: str,
     x_auth_token: str | None = Header(default=None, alias="X-Auth-Token"),
 ):
-    _require_auth(x_auth_token)
+    require_auth(x_auth_token)
     if scan_id not in SCANS:
         raise HTTPException(status_code=404, detail="Scan not found")
     scan = SCANS.pop(scan_id)
@@ -295,16 +271,21 @@ async def delete_scan(
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "nmap_available": subprocess.run(["which", "nmap"], capture_output=True).returncode == 0}
+    nmap_ok = subprocess.run(["which", "nmap"], capture_output=True).returncode == 0
+    return {
+        "status": "ok",
+        "nmap_available": nmap_ok,
+        "auth_enabled": bool(AUTH_TOKEN),
+        "scan_count": len(SCANS),
+    }
 
 
-# ─── Entrypoint ────────────────────────────────────────────────────────────────
+# ─── Entrypoint ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import uvicorn
-    print(f"Starting Nmap Web Backend on port {PORT}")
-    if AUTH_TOKEN:
-        print("Auth token is enabled")
-    else:
-        print("No auth token configured — set NMAP_AUTH_TOKEN env var to enable")
+    print(f"\n  Nmap Web Dashboard — Backend")
+    print(f"  Listening on  http://0.0.0.0:{PORT}")
+    print(f"  Auth token:   {'enabled' if AUTH_TOKEN else 'disabled (set NMAP_AUTH_TOKEN to enable)'}")
+    print(f"  nmap path:    {subprocess.run(['which', 'nmap'], capture_output=True, text=True).stdout.strip() or 'NOT FOUND'}\n")
     uvicorn.run(app, host="0.0.0.0", port=PORT)
