@@ -3,10 +3,10 @@
 A self-hosted, browser-based **nmap** scanning interface. Launch scans from your browser, view live results, and explore open ports, services, versions, and OS fingerprints.
 
 ```
-┌─────────────────────┐         HTTP/JSON         ┌──────────────────────┐
-│   React Frontend    │ ◄──────────────────────► │  Python FastAPI Backend│
-│   (Vite + JSX)      │        CORS allowed        │    (nmap wrapper)     │
-│   Runs anywhere     │                            │  Runs where nmap lives│
+┌─────────────────────┐         HTTP/JSON          ┌──────────────────────┐
+│   React Frontend    │ ◄──────────────────────►   │Python FastAPI Backend│
+│   (Vite + JSX)      │        CORS allowed        │   (nmap wrapper)     │
+│   Runs anywhere     │                            │ Runs where nmap lives│
 └─────────────────────┘                            └──────────────────────┘
 ```
 
